@@ -1,0 +1,246 @@
+scan_planner_node:
+  ros__parameters:
+    use_sim_time: false
+
+    fsm.navi_mode: 1
+    fsm.thresh_replan: 1.0
+    fsm.thresh_no_replan: 0.1
+    fsm.planning_horizon: 7.5
+    # A long Euclidean lookahead can jump across adjacent maze corridors.
+    # Reference paths therefore use a shorter arc-length lookahead.
+    fsm.reference_path_lookahead: 4.5
+    fsm.emergency_time: 1.0
+    fsm.rolling_replan_retry_period: 0.25
+    # Moving transit endpoints prepare a successor before their prefix ends.
+    # Observation capture and zero-speed conversion retain their rest gate.
+    fsm.rolling_replan_prepare_time: 1.50
+    fsm.rolling_replan_max_start_error: 0.30
+    # A future collision first requests a rolling A* + B-spline replacement.
+    # HOLD is reserved for the dynamic stopping horizon.
+    fsm.predictive_replan_reaction_time: 0.25
+    # Tracking mismatch remains a local SCAN repair problem.  A virtual
+    # recovery corridor does not by itself invalidate the Explorer route.
+    fsm.tracking_degraded_error: 0.10
+    fsm.tracking_recovery_max_error: 0.30
+    fsm.tracking_match_back_time: 0.40
+    # Also bounds Local's candidate start matching. The exact checked match
+    # is sent to Controller; its legacy search window cannot override it.
+    fsm.tracking_match_forward_time: 0.80
+    # The planning capsule uses radius=0.25 m with +/-0.18 m body centres.
+    # This is an additional hard planning belt checked only against immutable
+    # local-map snapshots; it is not baked into the map and does not enlarge
+    # Explorer's global obstacles.
+    fsm.planning_clearance_margin: 0.10
+    # The hard belt above remains the collision contract.  Entering this wider
+    # preferred belt is not a failure: it starts an early rolling replan and,
+    # when no wider corridor exists, installs a controller-enforced slow
+    # execution profile instead of waiting for a hard-margin violation.
+    fsm.preferred_clearance_margin: 0.20
+    # Measured ONNX forward gait: command 0.30 -> mean motion 0.165 m/s.
+    fsm.min_forward_command: 0.30
+    fsm.min_forward_effective_speed: 0.165
+    fsm.clearance_limited_max_forward_speed: 0.30
+    fsm.clearance_limited_max_lateral_speed: 0.08
+    fsm.clearance_limited_max_yaw_rate: 0.50
+    fsm.clearance_limited_max_tracking_correction: 0.08
+    # Once Controller ACKs a clearance-limited segment (hard-safe fallback
+    # or stop-limited transit), do not replace it every time startup tracking
+    # error crosses 0.10 m. Preserve
+    # one execution version long enough to observe real odometry progress;
+    # bounded no-progress becomes local recovery, never another clock reset.
+    fsm.clearance_limited_execution_grace: 1.00
+    fsm.clearance_limited_no_progress_timeout: 2.00
+    fsm.clearance_limited_min_progress: 0.05
+    # After ordinary approaches fail, use bounded local recovery without
+    # changing the Explorer task. These distance bounds apply to the
+    # turn-then-drive fallback; fixed-yaw side-steps use 0.15--0.45 m.
+    fsm.local_repair_anchor_min_distance: 0.45
+    fsm.local_repair_anchor_max_distance: 0.90
+    fsm.local_repair_anchor_step: 0.15
+    fsm.local_repair_max_backtrack: 0.60
+    fsm.local_repair_max_candidates: 6
+    # This is a transaction-wide cap across successive escape/rejoin cycles.
+    # It prevents every accepted short segment from opening a fresh candidate
+    # family and turning a failed rejoin into an unbounded left/right crawl.
+    fsm.local_repair_max_segments_per_transaction: 3
+    # Recovery segments start and end at rest. The separate lateral limit
+    # below keeps short side-steps from inheriting normal forward speed.
+    fsm.local_repair_max_speed: 0.30
+    fsm.local_repair_time_margin: 1.20
+    # Go2 supports left/right translation without turning. A bounded recovery
+    # keeps measured body yaw, certifies lateral braking and a rejoin, and
+    # authorizes zero forward command only for this recovery trajectory.
+    fsm.enable_holonomic_lateral_repair: true
+    # Legacy flat-ground probe: 0.15 command gave only 0.11 m in 8 s;
+    # 0.30 gave 0.90 m. Fixed-yaw recovery uses this bounded command rather
+    # than a shrinking spline derivative. Full lateral braking still checked.
+    fsm.local_repair_lateral_speed: 0.30
+    # Runtime safety predicts the actual odometry velocity through reaction
+    # and braking, sampling a short swept capsule instead of assuming that the
+    # robot remains exactly on the theoretical B-spline.
+    fsm.braking_sweep_spatial_step: 0.05
+    # 4 s covers a full stop from the observed ~0.85 m/s even with the
+    # conservative 0.32 m/s^2 guaranteed deceleration below.
+    fsm.braking_sweep_max_horizon: 4.0
+    # Stale perception or a severely delayed safety callback must HOLD, not
+    # merely print a warning. Recovery requires consecutive fresh callbacks.
+    fsm.safety_map_stale_warn_age: 0.25
+    fsm.safety_map_stale_hold_age: 0.50
+    fsm.safety_callback_hold_gap: 0.30
+    fsm.local_hold_release_cycles: 3
+    # Gazebo quadruped odometry oscillates within every gait cycle. Use a
+    # short world-frame pose history plus low-pass estimates instead of one
+    # raw body-frame twist sample.
+    fsm.odom_velocity_filter_tau: 0.20
+    fsm.motion_estimation_window: 0.35
+    fsm.yaw_rate_filter_tau: 0.15
+    # Trajectory acceleration is not a guaranteed RL-policy stopping rate.
+    # Keep the safety contract independent and conservative; normal operation
+    # still requests a rolling local repair before this final HOLD envelope.
+    fsm.guaranteed_braking_deceleration: 0.32
+    fsm.command_stop_latency: 0.30
+    # Candidate publication is only phase one.  SCAN keeps the old execution
+    # snapshot and safety latches until the controller accepts this version.
+    fsm.trajectory_ack_timeout: 0.75
+    # After the first ACK timeout, Controller receives a versioned HOLD.  This
+    # second deadline bounds how long SCAN waits for the exact execution state.
+    fsm.trajectory_ack_reconciliation_timeout: 0.75
+    # A new Explorer path cannot clear a physical pose-occupied latch.  Require
+    # consecutive free Local-map observations before planning resumes.
+    fsm.pose_free_release_cycles: 3
+    fsm.predictive_hard_stop_min_time: 0.35
+    fsm.goal_tolerance: 0.25
+    fsm.heading_freeze_max_recoveries: 2
+    fsm.fail_safe: true
+    fsm.max_replan_fail_count: 5
+
+    grid_map.resolution: 0.05
+    grid_map.sliding_map_size_x: 10.0
+    grid_map.sliding_map_size_y: 10.0
+    grid_map.sliding_map_size_z: 5.0
+    grid_map.local_update_range_x: 5.0
+    grid_map.local_update_range_y: 5.0
+    grid_map.local_update_range_z: 2.5
+    grid_map.map_sliding_en: true
+    grid_map.map_sliding_thresh: 0.2
+    # Planning envelope (not the Gazebo collision geometry). Keep Explorer's
+    # inflation and footprint radius identical; hard/preferred margins below
+    # remain separate checks, not extra inflation passes.
+    grid_map.double_cylinder_radius: 0.25
+    grid_map.double_cylinder_offset: 0.18
+    grid_map.self_filter_enabled: true
+    grid_map.self_filter_z_down: 0.45
+    grid_map.self_filter_z_up: 0.20
+    grid_map.body_height: 0.4
+    # The reference path from Explorer is 2D: it runs A* in the plane and
+    # writes z = 0.0, so the path z carries no terrain height.  A fixed
+    # body_height offset is only correct on flat ground; with the robot on a
+    # ledge the trajectory ends up inside the terrain and every replan
+    # collides at t = 0.  Tracking the live odometry height is correct on
+    # flat ground and on ledges alike.  Set false to restore the fixed offset.
+    grid_map.live_body_height: true
+    grid_map.obstacles_inflation_z_up: 0.1
+    grid_map.obstacles_inflation_z_down: 0.4
+    grid_map.frame_id: world
+    grid_map.sliding_map_frame_id: sliding_map
+    grid_map.ground_height: 0.0
+    grid_map.sensor_type: lidar
+    grid_map.cloud_is_world: true
+    grid_map.need_extrinsic: false
+    grid_map.pose_history_seconds: 0.50
+    grid_map.max_interpolation_gap: 0.05
+    grid_map.max_nearest_pose_age: 0.02
+    # Default real-robot IMU/lidar deployment transform. Gazebo overrides
+    # these from run.launch.py with the robot.xacro lidar_joint transform.
+    grid_map.lidar_extrinsic_x: -0.011
+    grid_map.lidar_extrinsic_y: -0.02329
+    grid_map.lidar_extrinsic_z: 0.04412
+    grid_map.lidar_extrinsic_roll: 0.0
+    grid_map.lidar_extrinsic_pitch: 0.0
+    grid_map.lidar_extrinsic_yaw: 0.0
+
+    grid_map.cx: 321.04638671875
+    grid_map.cy: 243.44969177246094
+    grid_map.fx: 387.229248046875
+    grid_map.fy: 387.229248046875
+    grid_map.depth_filter_maxdist: 3.0
+    grid_map.depth_filter_mindist: 0.3
+    grid_map.depth_filter_margin: 1
+    grid_map.k_depth_scaling_factor: 1000.0
+    grid_map.skip_pixel: 2
+
+    grid_map.p_hit: 0.85
+    grid_map.p_miss: 0.30
+    grid_map.p_min: 0.12
+    grid_map.p_max: 0.98
+    grid_map.p_occ: 0.80
+    grid_map.max_ray_length: 5.0
+    # Gazebo MID-360 uses identified 3-D rays; the planar input remains an
+    # explicit alternative. No-return limits are never obstacle endpoints.
+    grid_map.use_laser_scan: false
+    grid_map.use_ray_cloud: false
+    # Enabled by the Gazebo lidar launch. Route measured returns below this
+    # body-relative band to low_surface_returns, not obstacle occupancy.
+    # This is not a ground/support estimate and cannot certify a low step.
+    grid_map.separate_low_returns: false
+    grid_map.low_return_z_below_body: 0.25
+    # Upper half of the same platform band, and the reason a 3-D lidar does not
+    # block the corridor it walks through: returns above this boundary are
+    # overhead structure (timber beams, arches, a low ceiling) routed to
+    # high_surface_returns. Both bounds describe the body that a planar plan
+    # must keep clear; they are platform capability values, not preferences.
+    # Explorer derives obstacle_min_z/obstacle_max_z from these same two keys.
+    grid_map.separate_high_returns: false
+    grid_map.high_return_z_above_body: 0.25
+    grid_map.no_return_range: 3.0
+    # A historical wall must receive repeated explicit free observations
+    # before a miss is allowed to reduce its occupancy probability.
+    grid_map.occupied_miss_confirmation_frames: 3
+    # A terrain projection (hazard shown at body height) is released when its
+    # cell stops being observed as a hazard for this many scans: the robot
+    # moved past it or something now occludes it, and a stale block must not
+    # outlive the evidence that made it. At the 10 Hz MID-360 rate, 20 scans
+    # are about two seconds.
+    grid_map.terrain_projection_timeout_frames: 20
+    # Ground-relative clearance volume for measured returns whose height above
+    # the observed local ground is known (encoded in return_type; see
+    # plan_env/ground_height.hpp): below terrain_floor_tolerance the return is
+    # the ground, below obstacle_min_height the legs handle the terrain, the
+    # band up to obstacle_max_height can reach the body and blocks, above it is
+    # overhead structure. These are robot geometry plus capability statements:
+    # raise obstacle_min_height only when the execution layer actually
+    # certifies taller steps. Returns without a height estimate keep using the
+    # body-relative low/high band above.
+    grid_map.terrain_floor_tolerance: 0.035
+    grid_map.obstacle_min_height: 0.22
+    grid_map.obstacle_max_height: 0.55
+    grid_map.vis_height: 0.3
+    grid_map.body_obstacle_z_below: 0.12 # Display only; full occupancy remains collision authority.
+    grid_map.show_occ_time: false
+    # Shadow global-representation input. After a fusion revision completes, it
+    # samples the consistent inflated map without acquiring another map lock.
+    grid_map.local_patch_enabled: true
+    grid_map.local_patch_period: 0.25
+    grid_map.local_patch_resolution: 0.2
+    # Absolute fallback used only before the first valid body_pose. During
+    # normal operation the gravity-aligned patch follows a filtered body z.
+    grid_map.local_patch_z: 0.3
+    grid_map.local_patch_follow_body_z: true
+    grid_map.local_patch_z_filter_tau: 0.75
+    grid_map.local_patch_z_max_rate: 0.5
+
+    manager.max_vel: 0.75
+    manager.max_acc: 0.5
+    manager.max_jerk: 4.0
+    manager.control_points_distance: 0.2
+    manager.feasibility_tolerance: 0.5
+    manager.planning_horizon: 7.5
+
+    optimization.lambda_smooth: 1.0
+    optimization.lambda_collision: 1.0
+    optimization.lambda_feasibility: 0.1
+    optimization.lambda_fitness: 1.0
+    optimization.dist0: 0.10
+    optimization.max_vel: 0.75
+    optimization.max_acc: 0.5
+    optimization.order: 3

@@ -1,0 +1,40 @@
+# Explorer owns completion. Local goal changes do not change task_version.
+# Objective / lineage changes require a newer version or a new task_id.
+uint8 ACTIVE=1
+uint8 SUPERSEDED=2
+uint8 CANCELLED=3
+std_msgs/Header header
+uint64 task_id
+uint64 task_version
+uint64 request_id
+uint8 lifecycle
+# Normal observation completion may replace this predecessor without stopping
+# its safe execution prefix. Cancellation/supersession still uses stop-first.
+uint64 predecessor_task_id
+uint64 predecessor_task_version
+bool has_region
+uint64 region_id
+geometry_msgs/Point goal
+# Allowed domain: corridor around coarse_route UNION observation disk.
+geometry_msgs/Point[] coarse_route
+# False preserves the legacy geometric progress guards. True makes the route
+# a domain/approach hint, not an executable path or an observation ledger.
+bool local_geometry_autonomy
+# Empty: explicit geometric-domain fallback (NOT topological progress).
+# Nonempty: ordered directed checkpoints; frozen for this task/version.
+uint64 route_graph_revision
+RoutePortal[] route_portals
+float64 corridor_radius
+float64 observation_radius
+# Spatially distributed representatives; NOT the completion denominator.
+geometry_msgs/Point[] target_cells
+uint32 target_cell_count
+float64 resolution
+uint32 representative_selection_version
+geometry_msgs/Point[] terminal_cells
+uint32 max_station_adjustments
+# Optional world-space no-return gate inherited from region commitment.
+bool has_directional_gate
+geometry_msgs/Point gate_origin
+geometry_msgs/Vector3 gate_direction
+float64 gate_min_progress

@@ -1,0 +1,44 @@
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 1.0
+    costmap_update_timeout: 1.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner::NavfnPlanner"
+      tolerance: 0.5
+      use_astar: true
+      allow_unknown: true
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      global_frame: go2/odom
+      robot_base_frame: go2/base_footprint
+      rolling_window: true
+      width: 24
+      height: 24
+      resolution: 0.1
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      transform_tolerance: 0.5
+      robot_radius: 0.35
+      track_unknown_space: true
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: lidar
+        lidar:
+          topic: /quad_0/lidar_rays
+          data_type: "PointCloud2"
+          min_obstacle_height: 0.15
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          raytrace_max_range: 5.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 4.5
+          obstacle_min_range: 0.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.6

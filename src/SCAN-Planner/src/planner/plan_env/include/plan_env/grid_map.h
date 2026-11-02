@@ -1,0 +1,760 @@
+#ifndef _GRID_MAP_H
+#define _GRID_MAP_H
+
+#include <Eigen/Eigen>
+#include <Eigen/StdVector>
+#include <algorithm>
+#include <cv_bridge/cv_bridge.hpp>
+#include <cmath>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <iostream>
+#include <random>
+#include <nav_msgs/msg/odometry.hpp>
+#include <queue>
+#include <rclcpp/rclcpp.hpp>
+#include <atomic>
+#include <chrono>
+#include <deque>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <map>
+#include <mutex>
+#include <plan_env/planar_clearance_field.h>
+#include <plan_env/fusion_metrics.h>
+#include <shared_mutex>
+#include <set>
+#include <rmw/qos_profiles.h>
+#include <tuple>
+#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/image_encodings.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
+#include <scan_planner_msgs/msg/local_map_patch.hpp>
+#include <scan_planner_msgs/msg/locomotion_state.hpp>
+#include <scan_planner_msgs/msg/terrain_tile_summary.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+#include <visualization_msgs/msg/marker.hpp>
+
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl_conversions/pcl_conversions.h>
+
+#include <message_filters/subscriber.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <message_filters/sync_policies/exact_time.h>
+#include <message_filters/time_synchronizer.h>
+
+#include <plan_env/raycast.h>
+#include <plan_env/motion_evidence.h>
+
+#define logit(x) (log((x) / (1 - (x))))
+
+using namespace std;
+
+namespace plan_env
+{
+struct TimedPose
+{
+  int64_t stamp_ns{0};
+  Eigen::Vector3d position{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond orientation{Eigen::Quaterniond::Identity()};
+};
+
+enum class PoseLookupResult
+{
+  EXACT,
+  INTERPOLATED,
+  NEAREST,
+  TOO_OLD,
+  TOO_NEW,
+  GAP_TOO_LARGE,
+  EMPTY
+};
+
+PoseLookupResult lookupTimedPose(
+    const std::deque<TimedPose>& history, int64_t stamp_ns,
+    int64_t max_interpolation_gap_ns, int64_t max_nearest_age_ns,
+    TimedPose& result);
+
+double updateHeightReference(double current, double measurement,
+                             double dt_seconds, double filter_tau_seconds,
+                             double max_rate);
+
+bool pointInsideDoubleCylinder(
+    const Eigen::Vector3d& point, const Eigen::Vector3d& center,
+    const Eigen::Quaterniond& orientation, double radius, double offset,
+    double z_down, double z_up);
+int endpointObservation(bool self_filter_enabled, bool inside_self_filter);
+// A body-relative routing gate, not a ground/support classification. A low
+// measured endpoint is kept in the surface channel; only its ray prefix may
+// clear occupancy. A measured low endpoint must never become a no-return.
+bool lowReturnOutsideBodyBand(const Eigen::Vector3d& point,
+    const Eigen::Vector3d& body_position, bool separate_low_returns,
+    double below_body);
+// Symmetric upper gate. A measured endpoint above the body band is overhead
+// structure (timber beams, arches, a low tunnel ceiling) that a planar plan
+// under the body must not treat as an obstacle; it keeps its own channel and
+// only its ray prefix may clear occupancy.
+bool highReturnOutsideBodyBand(const Eigen::Vector3d& point,
+    const Eigen::Vector3d& body_position, bool separate_high_returns,
+    double above_body);
+struct ObservationRayTiming {
+  double lock_wait_ms{0.0}, query_ms{0.0};
+};
+struct LaserRangeEvidence { bool valid{false}; bool hit{false}; double length{0.}; };
+LaserRangeEvidence laserRangeEvidence(double measured, double minimum,
+    double maximum, double no_return_range);
+bool rayTraversalStopsAtOccupied(bool historically_occupied);
+bool occupiedMissHasEnoughConfirmation(
+    uint8_t consecutive_miss_frames, int required_frames);
+int8_t localPatchOccupancy(bool observed, bool inflated_occupied);
+// Sensor hypothesis only: query returns -1 outside, 0 unknown/free, 1 occupied.
+bool observationRayMayReach(
+    const Eigen::Vector3d& start, const Eigen::Vector3d& end, double resolution,
+    const std::function<int(const Eigen::Vector3d&)>& query);
+}
+
+// voxel hashing
+template <typename T>
+struct matrix_hash {
+  std::size_t operator()(T const& matrix) const {
+    size_t seed = 0;
+    for (size_t i = 0; i < matrix.size(); ++i) {
+      auto elem = *(matrix.data() + i);
+      seed ^= std::hash<typename T::Scalar>()(elem) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    }
+    return seed;
+  }
+};
+
+// constant parameters
+
+struct MappingParameters {
+
+  /* map properties */
+  Eigen::Vector3d map_origin_, map_size_;
+  Eigen::Vector3d map_min_boundary_, map_max_boundary_;  // map range in pos
+  Eigen::Vector3i map_voxel_num_;                        // map range in index
+  Eigen::Vector3i map_bound_min_idx_, map_bound_max_idx_;
+  Eigen::Vector3i map_origin_idx_;
+  Eigen::Vector3d local_update_range_;
+  double resolution_, resolution_inv_;
+  double obstacles_inflation_z_up, obstacles_inflation_z_down;
+  double double_cylinder_radius_, double_cylinder_offset_;
+  bool self_filter_enabled_;
+  // Platform capability bounds, not tuning preferences: the vertical extent of
+  // the body that a planar plan must keep clear. Measured endpoints outside
+  // [body - low_return_z_below_body, body + high_return_z_above_body] are
+  // surface / overhead evidence and never become occupancy. A 3-D lidar sees
+  // the floor and any overhead structure; a single band that spans far above
+  // the body turns every beam and arch into a blocked cell for a plan that
+  // never leaves the body plane.
+  bool separate_low_returns_{false};
+  double low_return_z_below_body_{0.25};
+  bool separate_high_returns_{false};
+  double high_return_z_above_body_{0.25};
+  double self_filter_z_down_, self_filter_z_up_;
+  bool map_sliding_en_;
+  double map_sliding_thresh_;
+  int map_sliding_thresh_vox_;
+  string frame_id_, sliding_map_frame_id_;
+
+  /* depth camera intrinsics */
+  double cx_, cy_, fx_, fy_;
+
+  /* depth image projection filtering */
+  double depth_filter_maxdist_, depth_filter_mindist_;
+  int depth_filter_margin_;
+  double k_depth_scaling_factor_;
+  int skip_pixel_;
+
+  /* raycasting */
+  double p_hit_, p_miss_, p_min_, p_max_, p_occ_;  // occupancy probability
+  double prob_hit_log_, prob_miss_log_, clamp_min_log_, clamp_max_log_,
+      min_occupancy_log_;                   // logit of occupancy probability
+  double min_ray_length_, max_ray_length_;  // range of doing raycasting
+  int occupied_miss_confirmation_frames_;
+  int terrain_projection_timeout_frames_;
+  // Ground-relative clearance volume for measured returns whose height above
+  // the observed local ground is known (plan_env/ground_height.hpp). Below
+  // terrain_floor_tolerance the return is the ground; up to obstacle_min_height
+  // the legs handle the terrain; the band up to obstacle_max_height can reach
+  // the body and blocks; above it is overhead structure. The body-relative
+  // low/high band (low_return_z_below_body / high_return_z_above_body) remains
+  // the fallback for returns without a height estimate.
+  double terrain_floor_tolerance_{0.035};
+  double obstacle_min_height_{0.22};
+  double obstacle_max_height_{0.55};
+
+  /* visualization and computation time display */
+  double vis_height_, ground_height_;
+  double body_obstacle_z_below_;
+  bool show_occ_time_;
+
+  /* mapping sensor input */
+  string sensor_type_;
+  bool use_laser_scan_{false};
+  bool use_ray_cloud_{false};
+  double no_return_range_{3.0};
+  bool cloud_is_world_;
+  bool need_extrinsic_;
+  Eigen::Matrix4d lidar_extrinsic_;
+  Eigen::Matrix4d depth_extrinsic_;
+  double pose_history_seconds_;
+  double max_interpolation_gap_seconds_;
+  double max_nearest_pose_age_seconds_;
+
+  /* active mapping */
+  double unknown_flag_;
+};
+
+// intermediate mapping data for fusion
+
+struct MappingData {
+  // main map data, occupancy of each voxel and Euclidean distance
+
+  std::vector<double> occupancy_buffer_;
+  // Terrain is projected at body height but measured at a different Z. Keep
+  // its provenance separate so renewed support can retract only that source,
+  // without erasing a real wall sharing the same voxel.
+  struct TerrainProjection {
+    Eigen::Vector3i id{Eigen::Vector3i::Zero()};
+    uint8_t hits{0};  // bounded leaky hazard evidence, released at zero
+    uint32_t last_scan{0};
+    plan_env::TerrainEvidence evidence;  // terrain scan index of the last hazard observation
+  };
+  std::map<std::pair<int,int>, TerrainProjection> terrain_projections_;
+  std::vector<char> terrain_projection_buffer_;
+  std::map<plan_env::SourceKey, plan_env::OccupancyEvidence> occupancy_sources_;
+  std::map<std::array<int,2>,plan_env::TerrainColumnEvidence> terrain_facts_;
+  // Monotonic scan counter for terrain provenance. raycast_num_ is a char
+  // used for dedup flags and wraps; an ordered counter cannot.
+  uint32_t terrain_scan_{0};
+  std::vector<char> occupancy_buffer_inflate_;
+  std::vector<int> occupancy_buffer_inflate_cnt_;
+  std::vector<uint8_t> occupied_miss_confirmation_count_;
+  vector<Eigen::Vector3i> inflate_offsets_;
+
+  // raycast origin and sensor pose data
+
+  Eigen::Vector3d ray_pos_;
+  Eigen::Quaterniond ray_q_;
+  // Capture-time BODY pose, independent of sensor extrinsics and of newer
+  // odometry callbacks. It belongs to the same pending observation as XYZ.
+  Eigen::Vector3d ray_body_pos_{Eigen::Vector3d::Zero()};
+  Eigen::Quaterniond ray_body_q_{Eigen::Quaterniond::Identity()};
+  std::vector<Eigen::Vector3d> low_surface_returns_;
+  std::vector<Eigen::Vector3d> high_surface_returns_;
+  Eigen::Vector3d sliding_map_frame_pos_;
+
+  // depth image data
+
+  cv::Mat depth_image_;
+  int image_cnt_;
+  // flags of map state
+
+  bool occ_need_update_;
+  bool use_cloud_update_;
+  bool has_first_depth_;
+  bool has_ray_pose_, has_cloud_;
+
+  // depth image projected point cloud
+
+  vector<Eigen::Vector3d> proj_points_;
+  vector<uint8_t> proj_hit_flags_; // empty for legacy cloud/depth; 0 means bounded clearing only
+  int proj_points_cnt;
+
+  // flag buffers for speeding up raycasting
+
+  vector<short> count_hit_, count_hit_and_miss_;
+  vector<char> flag_traverse_, flag_rayend_;
+  char raycast_num_;
+  queue<Eigen::Vector3i> cache_voxel_;
+
+  // range of updating grid
+
+  Eigen::Vector3i local_bound_min_, local_bound_max_;
+
+  // computation time
+
+  double fuse_time_, max_fuse_time_;
+  int update_num_;
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+
+class GridMap {
+public:
+  GridMap() {}
+  ~GridMap() {}
+
+  enum { INVALID_IDX = -10000 };
+
+  // occupancy map management
+  void resetBuffer();
+  void resetBuffer(Eigen::Vector3d min, Eigen::Vector3d max);
+
+  inline void posToIndex(const Eigen::Vector3d& pos, Eigen::Vector3i& id);
+  inline void indexToPos(const Eigen::Vector3i& id, Eigen::Vector3d& pos);
+  inline int toAddress(const Eigen::Vector3i& id);
+  inline int toAddress(int& x, int& y, int& z);
+  inline bool isInMap(const Eigen::Vector3d& pos);
+  inline bool isInMap(const Eigen::Vector3i& idx);
+
+  inline void setOccupancy(Eigen::Vector3d pos, double occ = 1);
+  inline void setOccupied(Eigen::Vector3d pos);
+  inline int getOccupancy(Eigen::Vector3d pos);
+  inline int getOccupancy(Eigen::Vector3i id);
+  bool observationRayMayReach(const Eigen::Vector3d& start, const Eigen::Vector3d& end,
+      plan_env::ObservationRayTiming* timing = nullptr);
+  inline int getInflateOccupancy(Eigen::Vector3d pos, double yaw);
+
+  inline void boundIndex(Eigen::Vector3i& id);
+  inline bool isUnknown(const Eigen::Vector3i& id);
+  inline bool isUnknown(const Eigen::Vector3d& pos);
+  inline bool isKnownFree(const Eigen::Vector3i& id);
+  inline bool isKnownOccupied(const Eigen::Vector3i& id);
+
+  struct InflatedOccupancySnapshot {
+    std::vector<char> buffer;
+    // Raw occupied bits share this snapshot's bounds/ring layout/revision.
+    // Unknown/free remain optical hypotheses; inflation is never used here.
+    std::vector<uint8_t> raw_occupied_bits;
+    int getRawOccupancy(const Eigen::Vector3d& point) const;
+    Eigen::Vector3i voxel_num{Eigen::Vector3i::Zero()};
+    Eigen::Vector3i bound_min{Eigen::Vector3i::Zero()};
+    Eigen::Vector3i bound_max{Eigen::Vector3i::Zero()};
+    double resolution_inv{1.0};
+    double body_offset{0.0};
+    uint64_t revision{0};
+    int64_t published_steady_ns{0};
+    double body_radius{0.};
+    Eigen::Vector3i inflation_min{Eigen::Vector3i::Zero()}, inflation_max{Eigen::Vector3i::Zero()};
+    std::set<plan_env::SourceKey> inflation_offsets;
+    std::map<plan_env::SourceKey, plan_env::OccupancyEvidence> sources;
+    std::map<std::array<int,2>,plan_env::TerrainColumnEvidence> terrain_facts;
+    plan_env::MotionAssessment assessMotion(const Eigen::Vector3d& pos, double yaw) const;
+    mutable std::mutex clearance_mutex;
+    mutable std::map<int, std::shared_ptr<const scan_planner::PlanarClearanceField>> clearance_slices;
+    int getCylinderOccupancy(const Eigen::Vector3d& point) const;
+    std::shared_ptr<const scan_planner::PlanarClearanceField> planarClearance(double z) const;
+
+    int getInflateOccupancy(
+        const Eigen::Vector3d& pos, double yaw,
+        const std::vector<Eigen::Vector2d>& clearance_offsets) const;
+  };
+  using InflatedOccupancySnapshotPtr = std::shared_ptr<const InflatedOccupancySnapshot>;
+
+  void setTerrainMotionPolicy(const plan_env::TerrainMotionPolicy& policy);
+  void initMap(rclcpp::Node* node,
+               rclcpp::CallbackGroup::SharedPtr update_callback_group = nullptr,
+               rclcpp::CallbackGroup::SharedPtr visualization_callback_group = nullptr);
+  InflatedOccupancySnapshotPtr captureInflatedOccupancySnapshot() const;
+  InflatedOccupancySnapshotPtr currentThreadOccupancySnapshot() const {
+    return tls_snapshot_owner_==this ? tls_snapshot_ : nullptr;
+  }
+  std::shared_ptr<const scan_planner::PlanarClearanceField> capturePlanarClearance(double z) const;
+  void useInflatedOccupancySnapshotForCurrentThread(
+      InflatedOccupancySnapshotPtr snapshot) const;
+  void clearInflatedOccupancySnapshotForCurrentThread() const;
+  void usePlanningClearanceMarginForCurrentThread(double margin) const;
+  void clearPlanningClearanceMarginForCurrentThread() const;
+  uint64_t getMapRevision() const { return map_revision_.load(); }
+  double getMapAgeSeconds() const;
+
+
+  void publishUnknown();
+  void publishDepth();
+  void publishDepthCloud();
+  void publishSlidingMapBBox();
+  void publishSlidingMapFrame();
+
+  bool hasDepthObservation();
+  bool odomValid();
+  void getRegion(Eigen::Vector3d& ori, Eigen::Vector3d& size);
+  inline double getResolution();
+  Eigen::Vector3d getOrigin();
+  int getVoxelNum();
+
+  typedef std::shared_ptr<GridMap> Ptr;
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+private:
+  MappingParameters mp_;
+  plan_env::TerrainMotionPolicy terrain_motion_policy_;
+  MappingData md_;
+  mutable std::shared_mutex map_mutex_;
+  std::atomic<uint64_t> map_revision_{0};
+  std::unique_ptr<plan_env::FusionMetrics> fusion_metrics_;
+  std::atomic<int64_t> last_map_update_ns_{0};
+  std::atomic<bool> perception_pose_valid_{false};
+  std::atomic<int64_t> locomotion_state_stamp_ns_{0};
+  std::deque<plan_env::TimedPose> lidar_pose_history_;
+  std::deque<plan_env::TimedPose> body_pose_history_;
+  bool bodyPoseAtScanLocked(int64_t stamp_ns, plan_env::TimedPose& pose) const;
+  mutable InflatedOccupancySnapshotPtr latest_inflated_snapshot_;
+  struct VisualizationSnapshot
+  {
+    InflatedOccupancySnapshotPtr inflated;
+    std::vector<char> occupied;
+    std::vector<Eigen::Vector3d> low_surface_returns;
+    std::vector<Eigen::Vector3d> high_surface_returns;
+    std::vector<plan_env::TerrainEvidence> terrain_facts;
+    double maximum_z;
+    double body_minimum_z;
+    int64_t stamp_ns;
+  };
+  std::shared_ptr<const VisualizationSnapshot> latest_visualization_snapshot_;
+  std::atomic<bool> visualization_refresh_requested_{true};
+  static thread_local const GridMap* tls_snapshot_owner_;
+  static thread_local InflatedOccupancySnapshotPtr tls_snapshot_;
+  static thread_local const GridMap* tls_clearance_owner_;
+  static thread_local double tls_planning_clearance_margin_;
+  static thread_local std::vector<Eigen::Vector2d> tls_clearance_offsets_;
+
+  // get depth image and sensor pose
+  void depthPoseCallback(const sensor_msgs::msg::Image::ConstSharedPtr& img,
+                         const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
+  void sensorPoseCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
+  void slidingMapFrameCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
+  void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& img);
+  void scanCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr& scan);
+  int64_t last_laser_stamp_ns_{0}, last_laser_clock_ns_{0};
+  int64_t last_ray_cloud_stamp_ns_{0};
+  int64_t last_raycast_sliding_ns_{0};
+  int64_t last_raycast_terrain_ns_{0};
+  int64_t last_raycast_loop_ns_{0};
+  void locomotionStateCallback(
+      const scan_planner_msgs::msg::LocomotionState::ConstSharedPtr& msg);
+  bool locomotionReady() const;
+
+  // update occupancy by raycasting
+  void updateOccupancyCallback();
+  void visCallback();
+  void updateVisualizationSnapshotLocked(InflatedOccupancySnapshotPtr snapshot);
+  void publishTerrainFacts(const std::vector<plan_env::TerrainEvidence>& facts,const rclcpp::Time& stamp);
+  void publishLowSurfaceReturns(const std::vector<Eigen::Vector3d>& points,
+                               const rclcpp::Time& stamp);
+  void publishHighSurfaceReturns(const std::vector<Eigen::Vector3d>& points,
+                                const rclcpp::Time& stamp);
+  void publishOccupancyCloud(
+      const std::vector<char>& buffer, const InflatedOccupancySnapshot& snapshot,
+      double maximum_z, const rclcpp::Time& stamp,
+      const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher,
+      double minimum_z = -std::numeric_limits<double>::infinity());
+  void publishLocalMapPatch();
+  bool buildLocalMapPatchLocked(
+      scan_planner_msgs::msg::LocalMapPatch& patch) const;
+  void fillTerrainTilesLocked(
+      double origin_x, double origin_y, uint32_t width, uint32_t height,
+      std::vector<scan_planner_msgs::msg::TerrainTileSummary>& tiles) const;
+  InflatedOccupancySnapshotPtr buildInflatedOccupancySnapshotLocked() const;
+
+  // main update process
+  void projectDepthImage();
+  void raycastProcess();
+  bool isInsideSelfFilter(const Eigen::Vector3d& point) const;
+
+  inline void inflatePoint(const Eigen::Vector3i& pt, int inf_step_xy, int inf_step_z_up, int inf_step_z_down, vector<Eigen::Vector3i>& pts);
+  inline int getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std::vector<char>& buffer);
+  inline int getLocalIndex(int id, int dim) const;
+  inline int toAddressLocal(const Eigen::Vector3i& id_l) const;
+  inline int toAddressLocal(int x, int y, int z) const;
+  int setCacheOccupancy(Eigen::Vector3d pos, int occ);
+  Eigen::Vector3d closetPointInMap(const Eigen::Vector3d& pt, const Eigen::Vector3d& ray_pos);
+  void updateSlidingMap(const Eigen::Vector3d& center);
+  void updateMapBoundaryFromIndex();
+  void resetAllMapData();
+  void resetCellByAddress(int addr);
+  void resetCellByAddressForSliding(int addr, const std::vector<char>& clear_mask);
+  void hashIdToGlobalIndex(int addr, Eigen::Vector3i& id_g) const;
+  void setTerrainProjection(const Eigen::Vector3i& id, bool occupied);
+  void applyOccupancyUpdate(const Eigen::Vector3i& id, double new_log_odds);
+  void rebuildInflationOffsets();
+  void updateInflation(const Eigen::Vector3i& id, int delta, const std::vector<char>* ignore_mask = nullptr);
+  void updateInflationLayer(const Eigen::Vector3i& id, int delta,
+                            const vector<Eigen::Vector3i>& offsets,
+                            std::vector<int>& cnt_buffer,
+                            std::vector<char>& flag_buffer,
+                            const std::vector<char>* ignore_mask);
+
+  // typedef message_filters::sync_policies::ExactTime<sensor_msgs::Image,
+  // nav_msgs::Odometry> SyncPolicyImageOdom; typedef
+  // message_filters::sync_policies::ExactTime<sensor_msgs::Image,
+  // nav_msgs::Odometry> SyncPolicyImagePose;
+  typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, nav_msgs::msg::Odometry>
+      SyncPolicyImagePose;
+  typedef shared_ptr<message_filters::Synchronizer<SyncPolicyImagePose>> SynchronizerImagePose;
+
+  rclcpp::Node* node_{nullptr};
+  std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> depth_sub_;
+  shared_ptr<message_filters::Subscriber<nav_msgs::msg::Odometry>> depth_pose_sub_;
+  SynchronizerImagePose sync_image_pose_;
+
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr lidar_pose_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sliding_map_frame_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+  rclcpp::Subscription<scan_planner_msgs::msg::LocomotionState>::SharedPtr locomotion_state_sub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_inf_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr low_surface_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr high_surface_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr body_obstacle_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr terrain_evidence_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr sliding_map_bbox_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr unknown_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr depth_cloud_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr extrinsic_pose_pub_;
+  rclcpp::Publisher<scan_planner_msgs::msg::LocalMapPatch>::SharedPtr local_patch_pub_;
+  rclcpp::TimerBase::SharedPtr occ_timer_, vis_timer_, local_patch_timer_;
+  bool local_patch_enabled_{true};
+  double local_patch_period_{0.25};
+  double local_patch_resolution_{0.2};
+  double local_patch_z_{0.3};
+  bool local_patch_follow_body_z_{true};
+  double local_patch_z_filter_tau_{0.75};
+  double local_patch_z_max_rate_{0.5};
+  bool local_patch_reference_z_initialized_{false};
+  double local_patch_reference_z_{0.3};
+  int64_t local_patch_reference_stamp_ns_{0};
+  uint64_t last_local_patch_revision_{0};
+  double local_patch_terrain_tile_size_{2.0};
+  // Written only by the patch timer thread; mutable because the builder is const.
+  mutable uint64_t content_revision_{0};
+  mutable uint64_t last_local_patch_content_hash_{0};
+  mutable bool last_local_patch_content_initialized_{false};
+
+  //
+  uniform_real_distribution<double> rand_noise_;
+  normal_distribution<double> rand_noise2_;
+  default_random_engine eng_;
+};
+
+/* ============================== definition of inline function
+ * ============================== */
+
+inline int GridMap::toAddress(const Eigen::Vector3i& id) {
+  return getLocalIndex(id(0), 0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) +
+         getLocalIndex(id(1), 1) * mp_.map_voxel_num_(2) + getLocalIndex(id(2), 2);
+}
+
+inline int GridMap::toAddress(int& x, int& y, int& z) {
+  return getLocalIndex(x, 0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) +
+         getLocalIndex(y, 1) * mp_.map_voxel_num_(2) + getLocalIndex(z, 2);
+}
+
+inline int GridMap::getLocalIndex(int id, int dim) const {
+  int local_id = id % mp_.map_voxel_num_(dim);
+  if (local_id < 0) local_id += mp_.map_voxel_num_(dim);
+  return local_id;
+}
+
+inline int GridMap::toAddressLocal(const Eigen::Vector3i& id_l) const {
+  return id_l(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) + id_l(1) * mp_.map_voxel_num_(2) + id_l(2);
+}
+
+inline int GridMap::toAddressLocal(int x, int y, int z) const {
+  return x * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) + y * mp_.map_voxel_num_(2) + z;
+}
+
+inline void GridMap::boundIndex(Eigen::Vector3i& id) {
+  Eigen::Vector3i id1;
+  id1(0) = max(min(id(0), mp_.map_bound_max_idx_(0)), mp_.map_bound_min_idx_(0));
+  id1(1) = max(min(id(1), mp_.map_bound_max_idx_(1)), mp_.map_bound_min_idx_(1));
+  id1(2) = max(min(id(2), mp_.map_bound_max_idx_(2)), mp_.map_bound_min_idx_(2));
+  id = id1;
+}
+
+inline bool GridMap::isUnknown(const Eigen::Vector3i& id) {
+  Eigen::Vector3i id1 = id;
+  boundIndex(id1);
+  return md_.occupancy_buffer_[toAddress(id1)] < mp_.clamp_min_log_ - 1e-3;
+}
+
+inline bool GridMap::isUnknown(const Eigen::Vector3d& pos) {
+  Eigen::Vector3i idc;
+  posToIndex(pos, idc);
+  return isUnknown(idc);
+}
+
+inline bool GridMap::isKnownFree(const Eigen::Vector3i& id) {
+  Eigen::Vector3i id1 = id;
+  boundIndex(id1);
+  int adr = toAddress(id1);
+
+  // return md_.occupancy_buffer_[adr] >= mp_.clamp_min_log_ &&
+  //     md_.occupancy_buffer_[adr] < mp_.min_occupancy_log_;
+  return md_.occupancy_buffer_[adr] >= mp_.clamp_min_log_ && md_.occupancy_buffer_inflate_[adr] == 0;
+}
+
+inline bool GridMap::isKnownOccupied(const Eigen::Vector3i& id) {
+  Eigen::Vector3i id1 = id;
+  boundIndex(id1);
+  int adr = toAddress(id1);
+
+  return md_.occupancy_buffer_inflate_[adr] == 1;
+}
+
+inline void GridMap::setOccupied(Eigen::Vector3d pos) {
+  if (!isInMap(pos)) return;
+
+  Eigen::Vector3i id;
+  posToIndex(pos, id);
+
+  applyOccupancyUpdate(id, mp_.clamp_max_log_);
+}
+
+inline void GridMap::setOccupancy(Eigen::Vector3d pos, double occ) {
+  if (occ != 1 && occ != 0) {
+    cout << "occ value error!" << endl;
+    return;
+  }
+
+  if (!isInMap(pos)) return;
+
+  Eigen::Vector3i id;
+  posToIndex(pos, id);
+
+  applyOccupancyUpdate(id, occ > 0.5 ? mp_.clamp_max_log_ : mp_.clamp_min_log_);
+}
+
+inline int GridMap::getOccupancy(Eigen::Vector3d pos) {
+  if (!isInMap(pos)) return -1;
+
+  Eigen::Vector3i id;
+  posToIndex(pos, id);
+
+  // Observation visibility sees measured geometry, not a motion capability veto.
+  return md_.occupancy_buffer_[toAddress(id)] > mp_.min_occupancy_log_ ? 1 : 0;
+}
+
+inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos, double yaw) {
+  if (tls_snapshot_owner_ == this && tls_snapshot_)
+  {
+    if (tls_clearance_owner_ == this)
+      return tls_snapshot_->getInflateOccupancy(
+          pos, yaw, tls_clearance_offsets_);
+    static const std::vector<Eigen::Vector2d> no_clearance_offsets;
+    return tls_snapshot_->getInflateOccupancy(
+        pos, yaw, no_clearance_offsets);
+  }
+
+  std::shared_lock<std::shared_mutex> lock(map_mutex_);
+  Eigen::Vector3d heading(std::cos(yaw), std::sin(yaw), 0.0);
+  Eigen::Vector3d front = pos + mp_.double_cylinder_offset_ * heading;
+  Eigen::Vector3d rear = pos - mp_.double_cylinder_offset_ * heading;
+
+  const auto query_with_margin = [this](
+      const Eigen::Vector3d& center) {
+    if (tls_clearance_owner_ != this || tls_clearance_offsets_.empty())
+      return getInflateOccupancyFromBuffer(
+          center, md_.occupancy_buffer_inflate_);
+    for (const Eigen::Vector2d &offset : tls_clearance_offsets_)
+    {
+      Eigen::Vector3d sample = center;
+      sample.head<2>() += offset;
+      const int occupancy = getInflateOccupancyFromBuffer(
+          sample, md_.occupancy_buffer_inflate_);
+      if (occupancy != 0)
+        return occupancy;
+    }
+    return 0;
+  };
+
+  int front_occ = query_with_margin(front);
+  if (front_occ != 0) return front_occ;
+
+  return query_with_margin(rear);
+}
+
+inline int GridMap::getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std::vector<char>& buffer) {
+  if (!isInMap(pos)) return -1;
+
+  Eigen::Vector3i id;
+  posToIndex(pos, id);
+
+  return int(buffer[toAddress(id)]);
+}
+
+inline int GridMap::getOccupancy(Eigen::Vector3i id) {
+  if (!isInMap(id))
+    return -1;
+
+  // Observation visibility sees measured geometry, not a motion capability veto.
+  return md_.occupancy_buffer_[toAddress(id)] > mp_.min_occupancy_log_ ? 1 : 0;
+}
+
+inline bool GridMap::isInMap(const Eigen::Vector3d& pos) {
+  if (pos(0) < mp_.map_min_boundary_(0) + 1e-4 || pos(1) < mp_.map_min_boundary_(1) + 1e-4 ||
+      pos(2) < mp_.map_min_boundary_(2) + 1e-4) {
+    // cout << "less than min range!" << endl;
+    return false;
+  }
+  if (pos(0) > mp_.map_max_boundary_(0) - 1e-4 || pos(1) > mp_.map_max_boundary_(1) - 1e-4 ||
+      pos(2) > mp_.map_max_boundary_(2) - 1e-4) {
+    return false;
+  }
+  return true;
+}
+
+inline bool GridMap::isInMap(const Eigen::Vector3i& idx) {
+  if (idx(0) < mp_.map_bound_min_idx_(0) || idx(1) < mp_.map_bound_min_idx_(1) ||
+      idx(2) < mp_.map_bound_min_idx_(2)) {
+    return false;
+  }
+  if (idx(0) > mp_.map_bound_max_idx_(0) || idx(1) > mp_.map_bound_max_idx_(1) ||
+      idx(2) > mp_.map_bound_max_idx_(2)) {
+    return false;
+  }
+  return true;
+}
+
+inline void GridMap::posToIndex(const Eigen::Vector3d& pos, Eigen::Vector3i& id) {
+  for (int i = 0; i < 3; ++i) id(i) = floor(pos(i) * mp_.resolution_inv_);
+}
+
+inline void GridMap::indexToPos(const Eigen::Vector3i& id, Eigen::Vector3d& pos) {
+  for (int i = 0; i < 3; ++i) pos(i) = (id(i) + 0.5) * mp_.resolution_;
+}
+
+inline void GridMap::inflatePoint(const Eigen::Vector3i& pt, int inf_step_xy, int inf_step_z_up, int inf_step_z_down, vector<Eigen::Vector3i>& pts) {
+
+  /* ---------- + shape inflate ---------- */
+  // for (int x = -step; x <= step; ++x)
+  // {
+  //   if (x == 0)
+  //     continue;
+  //   pts[num++] = Eigen::Vector3i(pt(0) + x, pt(1), pt(2));
+  // }
+  // for (int y = -step; y <= step; ++y)
+  // {
+  //   if (y == 0)
+  //     continue;
+  //   pts[num++] = Eigen::Vector3i(pt(0), pt(1) + y, pt(2));
+  // }
+  // for (int z = -1; z <= 1; ++z)
+  // {
+  //   pts[num++] = Eigen::Vector3i(pt(0), pt(1), pt(2) + z);
+  // }
+
+  /* ---------- all inflate ---------- */
+  pts.clear();
+  for (int x = -inf_step_xy; x <= inf_step_xy; ++x)
+    for (int y = -inf_step_xy; y <= inf_step_xy; ++y)
+    {
+      if (std::sqrt(x * x + y * y) > inf_step_xy)
+        continue;
+
+      for (int z = -inf_step_z_down; z <= inf_step_z_up; ++z) {
+        pts.push_back(Eigen::Vector3i(pt(0) + x, pt(1) + y, pt(2) + z));
+      }
+    }
+}
+
+inline double GridMap::getResolution() { return mp_.resolution_; }
+
+#endif

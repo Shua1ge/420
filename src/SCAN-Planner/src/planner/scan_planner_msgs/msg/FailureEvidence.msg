@@ -1,0 +1,30 @@
+uint8 CLEARANCE_NONE=0
+uint8 CLEARANCE_PHYSICAL_COLLISION=1
+uint8 CLEARANCE_PLANNING_MARGIN=2
+uint8 CLEARANCE_ESCAPE_WORSENING=3
+uint8 CLEARANCE_ESCAPE_TIMEOUT=4
+
+uint8 SCOPE_PATH=1
+uint8 SCOPE_VIEWPOINT=2
+uint8 SCOPE_PORTAL=3
+uint8 SCOPE_REGION=4
+
+builtin_interfaces/Time stamp
+uint64 request_id
+uint64 task_id
+uint64 task_version
+# Stable topology ID for PORTAL / REGION; task-local stable ID for VIEWPOINT.
+uint64 failed_object_id
+# Candidate trajectory whose path failed validation; it may not be ACKed.
+int64 trajectory_id
+string stage
+string reason
+geometry_msgs/Point position
+uint32 attempted_candidates
+float64 required_clearance
+uint8 clearance_failure
+uint8 failure_scope
+# PATH evidence is task-local geometry. It is not an occupancy observation.
+bool has_path_segment
+geometry_msgs/Point path_start
+geometry_msgs/Point path_end

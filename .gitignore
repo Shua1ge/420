@@ -5,8 +5,7 @@ log/
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 .venv/
 venv/
 
@@ -33,3 +32,15 @@ Thumbs.db
 
 # Experiment outputs
 results/raw/
+bench/*.csv
+bench/*.log
+**/audit_data.json
+**/symlink_install_manifest.txt
+
+# Local agent settings
+**/.claude/
+
+# Bags / recordings
+*.bag
+*.db3
+*.mcap
